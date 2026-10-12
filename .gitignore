@@ -1,0 +1,14 @@
+.env
+cache/
+venv/
+__pycache__/
+*.pyc
+*.zip
+*.egg-info/
+dist/
+build/
+.DS_Store
+Thumbs.db
+logs/*.log
+output/level1.csv
+output/level2.csv

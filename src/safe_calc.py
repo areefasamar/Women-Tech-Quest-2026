@@ -21,7 +21,6 @@ def avg(lst: list) -> float:
     vals = [x for x in lst if x is not None]
     return sum(vals) / len(vals) if vals else 0.0
 
-
 def pct(part: Any, whole: Any) -> float:
     """100 * part / whole. Returns 0 if whole is 0 or None."""
     try:

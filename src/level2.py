@@ -6,13 +6,14 @@ which is fast and reliable. Upgrade path: plan → compute → write is
 also implemented and can be enabled by setting USE_PLAN_FLOW=True.
 """
 from __future__ import annotations
+import ast
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from src.llm_client import call_gemini
-from src.safe_calc import safe_eval, avg, pct, pluck
+from src.safe_calc import safe_eval, avg, pct, pluck, _SAFE_BUILTINS
 from src.pii_guard import scrub, check_no_pii
 from src.schemas import BillFacts
 from src.config import PROMPTS_DIR
@@ -31,6 +32,93 @@ def _write_prompt() -> str:
     return (PROMPTS_DIR / "l2_write_system.md").read_text(encoding="utf-8")
 
 
+# ── calc_text helper functions ────────────────────────────────────────────────
+
+_OP_SYMBOLS = {
+    ast.Add: "+",
+    ast.Sub: "-",
+    ast.Mult: "*",
+    ast.Div: "/",
+    ast.FloorDiv: "//",
+    ast.Mod: "%",
+    ast.Pow: "**",
+}
+
+_CMP_SYMBOLS = {
+    ast.Eq: "==",
+    ast.NotEq: "!=",
+    ast.Lt: "<",
+    ast.LtE: "<=",
+    ast.Gt: ">",
+    ast.GtE: ">=",
+}
+
+
+def _format_operand(val: Any, is_result: bool = False) -> str:
+    if val is None or val == "error":
+        return ""
+    if isinstance(val, bool):
+        return str(val)
+    if isinstance(val, (int, float)):
+        if isinstance(val, float):
+            if is_result:
+                val = round(val, 2)
+            if val.is_integer():
+                return f"{int(val):,}"
+            return f"{val:,.2f}"
+        if isinstance(val, int):
+            return f"{val:,}"
+    return str(val)
+
+
+def _build_calc_text(expr: str, l1: dict, facts: dict, result: Any) -> Optional[str]:
+    """
+    Build a calc_text string from the real operands and result,
+    e.g. '3,430.24 / 151 = 22.72'.
+    """
+    if result == "error" or result is None:
+        return None
+    try:
+        tree = ast.parse(expr, mode="eval")
+        body = tree.body
+        if isinstance(body, ast.Call) and getattr(body.func, "id", None) == "round" and len(body.args) >= 1:
+            body = body.args[0]
+
+        ns = dict(_SAFE_BUILTINS)
+        ns["l1"] = l1
+        ns["facts"] = facts
+
+        if isinstance(body, ast.BinOp):
+            op_sym = _OP_SYMBOLS.get(type(body.op), "?")
+            left_val = eval(compile(ast.Expression(body.left), "<left>", "eval"), {"__builtins__": {}}, ns)
+            right_val = eval(compile(ast.Expression(body.right), "<right>", "eval"), {"__builtins__": {}}, ns)
+            return f"{_format_operand(left_val)} {op_sym} {_format_operand(right_val)} = {_format_operand(result, is_result=True)}"
+
+        elif isinstance(body, ast.Call):
+            func_name = getattr(body.func, "id", "")
+            if func_name == "pct" and len(body.args) == 2:
+                p_val = eval(compile(ast.Expression(body.args[0]), "<arg0>", "eval"), {"__builtins__": {}}, ns)
+                w_val = eval(compile(ast.Expression(body.args[1]), "<arg1>", "eval"), {"__builtins__": {}}, ns)
+                return f"({_format_operand(p_val)} / {_format_operand(w_val)}) * 100 = {_format_operand(result, is_result=True)}%"
+            elif func_name in ("avg", "sum", "min", "max") and len(body.args) >= 1:
+                arg_val = eval(compile(ast.Expression(body.args[0]), "<arg0>", "eval"), {"__builtins__": {}}, ns)
+                return f"{func_name}({_format_operand(arg_val)}) = {_format_operand(result, is_result=True)}"
+
+        elif isinstance(body, ast.Compare) and len(body.ops) == 1 and len(body.comparators) == 1:
+            op_sym = _CMP_SYMBOLS.get(type(body.ops[0]), "?")
+            left_val = eval(compile(ast.Expression(body.left), "<left>", "eval"), {"__builtins__": {}}, ns)
+            right_val = eval(compile(ast.Expression(body.comparators[0]), "<right>", "eval"), {"__builtins__": {}}, ns)
+            return f"{_format_operand(left_val)} {op_sym} {_format_operand(right_val)} = {_format_operand(result, is_result=True)}"
+
+    except Exception as exc:
+        logger.debug("Could not build calc_text for %r: %s", expr, exc)
+    return None
+
+
+def _entry(val: Any, calc_text: Optional[str] = None) -> dict:
+    return {"value": val, "calc_text": calc_text}
+
+
 # ── generic pre-computed metrics (MVP shortcut base) ─────────────────────────
 
 def _compute_metrics(l1: dict, facts: dict) -> dict:
@@ -45,37 +133,55 @@ def _compute_metrics(l1: dict, facts: dict) -> dict:
     pwdd = l1.get("payable_within_due_date")
     padd = l1.get("payable_after_due_date")
 
-    late_surcharge = None
-    if pwdd is not None and padd is not None:
-        late_surcharge = round(padd - pwdd, 2)
+    cost_per_unit = None
+    cpu_calc = None
+    cost_per_unit_charges = None
+    cpuc_calc = None
+    if uc and uc > 0:
+        cost_per_unit = safe_eval("l1['current_bill'] / l1['units_consumed']", l1, facts)
+        cpu_calc = _build_calc_text("l1['current_bill'] / l1['units_consumed']", l1, facts, cost_per_unit)
+        cost_per_unit_charges = safe_eval("l1['total_charges'] / l1['units_consumed']", l1, facts)
+        cpuc_calc = _build_calc_text("l1['total_charges'] / l1['units_consumed']", l1, facts, cost_per_unit_charges)
 
-    cost_per_unit = round(cb / uc, 4) if uc and uc > 0 else None
-    tax_share_pct = pct(tt, cb) if cb else None
-    energy_share_pct = pct(tc, cb) if cb else None
+    tax_share_pct = safe_eval("pct(l1['total_taxes'], l1['current_bill'])", l1, facts) if cb else None
+    tax_calc = _build_calc_text("pct(l1['total_taxes'], l1['current_bill'])", l1, facts, tax_share_pct) if cb else None
+
+    energy_share_pct = safe_eval("pct(l1['total_charges'], l1['current_bill'])", l1, facts) if cb else None
+    energy_calc = _build_calc_text("pct(l1['total_charges'], l1['current_bill'])", l1, facts, energy_share_pct) if cb else None
+
+    late_surcharge = None
+    late_calc = None
+    if pwdd is not None and padd is not None:
+        late_surcharge = safe_eval("l1['payable_after_due_date'] - l1['payable_within_due_date']", l1, facts)
+        late_calc = _build_calc_text("l1['payable_after_due_date'] - l1['payable_within_due_date']", l1, facts, late_surcharge)
+
+    mom_change = None
+    mom_calc = None
+    if len(usage) >= 2:
+        mom_change = round(usage[-1] - usage[-2], 1)
+        mom_calc = f"{_format_operand(usage[-1])} - {_format_operand(usage[-2])} = {_format_operand(mom_change, is_result=True)}"
 
     metrics = {
-        "cost_per_unit_pkr": cost_per_unit,
-        "tax_share_pct": tax_share_pct,
-        "energy_share_pct": energy_share_pct,
-        "usage_avg_units": round(avg(usage), 1) if usage else None,
-        "usage_max_units": max(usage) if usage else None,
-        "usage_min_units": min(usage) if usage else None,
-        "usage_months_count": len(usage),
-        "change_vs_last_month_units": None,
-        "late_payment_surcharge_pkr": late_surcharge,
-        "arrears_is_credit": (arrears is not None and arrears < 0),
-        "total_charges": tc,
-        "total_taxes": tt,
-        "current_bill": cb,
-        "units_consumed": uc,
-        "arrears": arrears,
-        "payable_within_due_date": pwdd,
-        "payable_after_due_date": padd,
+        "cost_per_unit_pkr": _entry(cost_per_unit, cpu_calc),
+        "cost_per_unit_whole_bill_pkr": _entry(cost_per_unit, cpu_calc),
+        "cost_per_unit_charges_only_pkr": _entry(cost_per_unit_charges, cpuc_calc),
+        "tax_share_pct": _entry(tax_share_pct, tax_calc),
+        "energy_share_pct": _entry(energy_share_pct, energy_calc),
+        "usage_avg_units": _entry(round(avg(usage), 1) if usage else None),
+        "usage_max_units": _entry(max(usage) if usage else None),
+        "usage_min_units": _entry(min(usage) if usage else None),
+        "usage_months_count": _entry(len(usage)),
+        "change_vs_last_month_units": _entry(mom_change, mom_calc),
+        "late_payment_surcharge_pkr": _entry(late_surcharge, late_calc),
+        "arrears_is_credit": _entry(arrears is not None and arrears < 0),
+        "total_charges": _entry(tc),
+        "total_taxes": _entry(tt),
+        "current_bill": _entry(cb),
+        "units_consumed": _entry(uc),
+        "arrears": _entry(arrears),
+        "payable_within_due_date": _entry(pwdd),
+        "payable_after_due_date": _entry(padd),
     }
-
-    # Month-over-month change
-    if len(usage) >= 2:
-        metrics["change_vs_last_month_units"] = round(usage[-1] - usage[-2], 1)
 
     return metrics
 
@@ -182,7 +288,9 @@ def _plan_compute_write(
                 name = calc.get("name", "")
                 expr = calc.get("expression", "")
                 if name and expr:
-                    computed[name] = safe_eval(expr, l1, facts)
+                    val = safe_eval(expr, l1, facts)
+                    calc_text = _build_calc_text(expr, l1, facts, val)
+                    computed[name] = _entry(val, calc_text)
             computed_per_q[qid] = computed
 
     except Exception as exc:

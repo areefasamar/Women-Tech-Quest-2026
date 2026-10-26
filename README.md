@@ -98,15 +98,6 @@ Optional flags:
 
 ---
 
-## Run – Web UI (Flask)
-
-```bash
-python app.py
-# Open: http://localhost:5000
-```
-
-Upload a bill photo, see extracted fields and ask questions. Same pipeline as the CLI.
-
 ---
 
 ## Design Decisions
@@ -154,7 +145,6 @@ Upload a bill photo, see extracted fields and ask questions. Same pipeline as th
 
 ```
 main.py              CLI entry point
-app.py               Flask web server (thin layer over src/)
 src/
   config.py          Reads .env
   llm_client.py      Gemini wrapper: rate limit, retry, cache

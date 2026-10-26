@@ -52,5 +52,9 @@ Examples:
   and explain in missing_info.
 - If the bill shows net metering, negative dues, or credit balances, note this
   in the interpretation.
+- If a question has more than one reasonable meaning (for example cost per unit with the whole bill vs charges only), state the meaning used or give both, each with its own computed value.
+- Use the labels as printed on the bill. Don't expand acronyms (FCA, FPA, MUCT) with outside knowledge.
+- Sanctioned load and the fixed charge quantity are in kW. Never call them "units".
+- If two questions ask for the same thing, give consistent answers.
 - Keep expressions short and readable. One expression per named value.
 - Do NOT write narrative answers here – only the plan.
